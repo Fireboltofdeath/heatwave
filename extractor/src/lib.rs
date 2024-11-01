@@ -2,8 +2,11 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     path::{self, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
+use ai::AiQueue;
+use chatgpt::client::ChatGPT;
 use fs_err as fs;
 
 use anyhow::bail;
@@ -25,6 +28,7 @@ use serde::Serialize;
 use tags::{validate_global_tags, Tag};
 use walkdir::{self, WalkDir};
 
+mod ai;
 mod cli;
 mod diagnostic;
 mod doc_comment;
@@ -54,7 +58,7 @@ struct OutputClass<'a> {
 
 type CodespanFilesPaths = (PathBuf, usize);
 
-pub fn generate_docs_from_path(input_path: &Path, base_path: &Path) -> anyhow::Result<()> {
+pub async fn generate_docs_from_path(input_path: &Path, base_path: &Path) -> anyhow::Result<()> {
     let (codespan_files, files) = find_files(input_path)?;
 
     let mut errors: Vec<Error> = Vec::new();
@@ -96,7 +100,11 @@ pub fn generate_docs_from_path(input_path: &Path, base_path: &Path) -> anyhow::R
     }
 
     match into_classes(entries) {
-        Ok(classes) => {
+        Ok(mut classes) => {
+            for class in &mut classes {
+                feed_to_ai(class).await;
+            }
+
             if errors.is_empty() {
                 println!("{}", serde_json::to_string_pretty(&classes)?);
             }
@@ -117,6 +125,102 @@ pub fn generate_docs_from_path(input_path: &Path, base_path: &Path) -> anyhow::R
     }
 
     Ok(())
+}
+
+async fn feed_to_ai(output: &mut OutputClass<'_>) {
+    let Ok(key) = std::env::var("AI_KEY") else {
+        return;
+    };
+
+    let mut queue = AiQueue {
+        context: generate_class_context(&output.class),
+        client: Arc::new(ChatGPT::new(key).expect("gpt never fails")),
+        handles: Vec::new(),
+        results: Arc::new(Mutex::new(Vec::new())),
+    };
+
+    queue.gen("description", &output.class.desc);
+
+    for function in &output.functions {
+        queue.context = generate_func_context(&output.class, function);
+        queue.gen("function description", &function.desc);
+
+        for param in &function.params {
+            if !param.desc.is_empty() {
+                queue.gen(
+                    &format!("function parameter \"{}\" description", param.name),
+                    &param.desc,
+                );
+            }
+        }
+    }
+
+    for handle in queue.handles {
+        handle.await.unwrap();
+    }
+
+    let mut results = queue.results.lock().unwrap().clone().into_iter();
+    output.class.desc = results.next().unwrap();
+
+    for function in &mut output.functions {
+        function.desc = results.next().unwrap();
+
+        for param in &mut function.params {
+            if !param.desc.is_empty() {
+                param.desc = results.next().unwrap();
+            }
+        }
+    }
+}
+
+fn generate_class_context(class: &ClassDocEntry<'_>) -> String {
+    let mut context = String::new();
+
+    context.push_str("class ");
+    context.push_str(&class.name);
+    context.push(';');
+    context.push('\n');
+    context.push_str(&format!("Explanation of behavior: {}", class.desc));
+
+    context
+}
+
+fn generate_func_context(class: &ClassDocEntry<'_>, func: &FunctionDocEntry<'_>) -> String {
+    let mut context = String::new();
+
+    context.push_str("function ");
+    context.push_str(&class.name);
+    context.push(':');
+    context.push_str(&func.name);
+    context.push('(');
+
+    for param in &func.params {
+        context.push_str(&param.name);
+        context.push_str(": ");
+        context.push_str(&param.lua_type);
+    }
+
+    context.push(')');
+
+    if !func.returns.is_empty() {
+        context.push_str(": ");
+
+        let returns = func
+            .returns
+            .iter()
+            .map(|v| &*v.lua_type)
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        context.push('(');
+        context.push_str(&returns);
+        context.push(')');
+    }
+
+    context.push(';');
+    context.push('\n');
+    context.push_str(&format!("Explanation of behavior: {}", func.desc));
+    context
 }
 
 fn into_classes<'a>(entries: Vec<DocEntry<'a>>) -> Result<Vec<OutputClass<'a>>, Diagnostics> {
