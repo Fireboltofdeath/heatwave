@@ -2,7 +2,7 @@ use libmoonwave::{generate_docs_from_path, Args, Subcommand};
 use std::env::current_dir;
 use structopt::StructOpt;
 
-fn run(args: Args) -> anyhow::Result<()> {
+async fn run(args: Args) -> anyhow::Result<()> {
     match args.subcommand {
         Subcommand::Extract(subcommand) => {
             let path = match subcommand.input_path {
@@ -15,15 +15,16 @@ fn run(args: Args) -> anyhow::Result<()> {
                 None => path.clone(),
             };
 
-            generate_docs_from_path(&path, &base_path)
+            generate_docs_from_path(&path, &base_path).await
         }
     }
 }
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args = Args::from_args();
 
-    if let Err(error) = run(args) {
+    if let Err(error) = run(args).await {
         eprintln!("error: {}", error);
         std::process::exit(1);
     }
